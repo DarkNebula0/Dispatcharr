@@ -3,6 +3,8 @@ from django.http import HttpResponse, JsonResponse, Http404, HttpResponseForbidd
 from rest_framework.response import Response
 from django.urls import reverse
 from apps.channels.models import Channel, ChannelProfile, ChannelGroup
+from apps.vod.models import Movie, Series, Episode
+from apps.m3u.models import M3UAccountProfile
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from apps.epg.models import ProgramData
@@ -289,6 +291,156 @@ def generate_m3u(request, profile_name=None, user=None):
 
     response = HttpResponse(m3u_content, content_type="audio/x-mpegurl")
     response["Content-Disposition"] = 'attachment; filename="channels.m3u"'
+    return response
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST", "HEAD"])
+def generate_vod_m3u(request, profile_name=None, user=None):
+    """
+    Dynamically generate an M3U file from VOD content (movies and series/episodes).
+    All stream URLs point to the VOD proxy endpoints.
+    Supports both GET and POST methods for compatibility with IPTVSmarters.
+    """
+    logger.debug("Generating VOD M3U for profile: %s, user: %s, method: %s", profile_name, user.username if user else "Anonymous", request.method)
+
+    # Check cache for recent identical request (helps with double-GET from browsers)
+    from django.core.cache import cache
+    cache_params = f"vod:{profile_name or 'all'}:{user.username if user else 'anonymous'}:{request.GET.urlencode()}"
+    content_cache_key = f"vod_m3u_content:{cache_params}"
+
+    cached_content = cache.get(content_cache_key)
+    if cached_content:
+        logger.debug("Serving VOD M3U from cache")
+        response = HttpResponse(cached_content, content_type="audio/x-mpegurl")
+        response["Content-Disposition"] = 'attachment; filename="vod.m3u"'
+        return response
+
+    # Check if this is a POST request with data (which we don't want to allow)
+    if request.method == "POST" and request.body:
+        if request.body.decode() != '{}':
+            return HttpResponseForbidden("POST requests with body are not allowed, body is: {}".format(request.body.decode()))
+
+    # Get M3U profile if profile_name is provided
+    m3u_profile = None
+    if profile_name is not None:
+        try:
+            m3u_profile = M3UAccountProfile.objects.get(name=profile_name, is_active=True)
+        except M3UAccountProfile.DoesNotExist:
+            logger.warning("Requested M3U account profile (%s) during VOD m3u generation does not exist", profile_name)
+            raise Http404(f"M3U account profile '{profile_name}' not found")
+
+    # Filter Movies - only those with active M3U relations
+    movies_query = Movie.objects.filter(
+        m3u_relations__m3u_account__is_active=True
+    ).distinct()
+
+    # Filter by profile's M3U account if profile is specified
+    if m3u_profile:
+        movies_query = movies_query.filter(m3u_relations__m3u_account=m3u_profile.m3u_account)
+
+    movies = movies_query.select_related('logo').order_by('name')
+
+    # Filter Episodes - only those with active M3U relations
+    episodes_query = Episode.objects.filter(
+        m3u_relations__m3u_account__is_active=True
+    ).select_related('series', 'series__logo').distinct()
+
+    # Filter by profile's M3U account if profile is specified
+    if m3u_profile:
+        episodes_query = episodes_query.filter(m3u_relations__m3u_account=m3u_profile.m3u_account)
+
+    episodes = episodes_query.order_by('series__name', 'season_number', 'episode_number')
+
+    # Check if the request wants to use direct logo URLs instead of cache
+    use_cached_logos = request.GET.get('cachedlogos', 'true').lower() != 'false'
+
+    # Start building M3U content
+    m3u_content = "#EXTM3U\n"
+
+    # Add movies
+    for movie in movies:
+        tvg_id = movie.tmdb_id or movie.imdb_id or str(movie.uuid)
+        tvg_name = movie.name
+        tvg_logo = ""
+
+        # Handle logo URL
+        if movie.logo:
+            if use_cached_logos:
+                # Use cached logo API endpoint
+                try:
+                    tvg_logo = build_absolute_uri_with_port(request, reverse('api:vod:vodlogo-cache', args=[movie.logo.id]))
+                except:
+                    # Fallback to direct logo URL if API endpoint doesn't exist
+                    if movie.logo.url and movie.logo.url.startswith(('http://', 'https://')):
+                        tvg_logo = movie.logo.url
+            else:
+                # Use direct logo URL if available
+                if movie.logo.url and movie.logo.url.startswith(('http://', 'https://')):
+                    tvg_logo = movie.logo.url
+
+        extinf_line = f'#EXTINF:-1 tvg-id="{tvg_id}"'
+        if tvg_logo:
+            extinf_line += f' tvg-logo="{tvg_logo}"'
+        extinf_line += f' group-title="Movies",{tvg_name}\n'
+
+        # Always use proxy URL - never direct provider URLs
+        stream_url = build_absolute_uri_with_port(request, f"/proxy/vod/movie/{movie.uuid}/")
+
+        m3u_content += extinf_line + stream_url + "\n"
+
+    # Add series episodes
+    for episode in episodes:
+        series = episode.series
+        tvg_id = series.tmdb_id or series.imdb_id or str(series.uuid)
+        tvg_name = f"{series.name} - S{episode.season_number:02d}E{episode.episode_number:02d}" if episode.season_number is not None and episode.episode_number is not None else f"{series.name} - {episode.name}"
+        tvg_logo = ""
+
+        # Handle logo URL (use series logo if available)
+        if series.logo:
+            if use_cached_logos:
+                # Use cached logo API endpoint
+                try:
+                    tvg_logo = build_absolute_uri_with_port(request, reverse('api:vod:vodlogo-cache', args=[series.logo.id]))
+                except:
+                    # Fallback to direct logo URL if API endpoint doesn't exist
+                    if series.logo.url and series.logo.url.startswith(('http://', 'https://')):
+                        tvg_logo = series.logo.url
+            else:
+                # Use direct logo URL if available
+                if series.logo.url and series.logo.url.startswith(('http://', 'https://')):
+                    tvg_logo = series.logo.url
+
+        extinf_line = f'#EXTINF:-1 tvg-id="{tvg_id}"'
+        if tvg_logo:
+            extinf_line += f' tvg-logo="{tvg_logo}"'
+        extinf_line += f' group-title="Series",{tvg_name}\n'
+
+        # Always use proxy URL - never direct provider URLs
+        stream_url = build_absolute_uri_with_port(request, f"/proxy/vod/episode/{episode.uuid}/")
+
+        m3u_content += extinf_line + stream_url + "\n"
+
+    # Cache the generated content for 2 seconds to handle double-GET requests
+    cache.set(content_cache_key, m3u_content, 2)
+
+    # Log system event for VOD M3U download (with deduplication based on client)
+    client_id, client_ip, user_agent = get_client_identifier(request)
+    event_cache_key = f"vod_m3u_download:{user.username if user else 'anonymous'}:{profile_name or 'all'}:{client_id}"
+    if not cache.get(event_cache_key):
+        log_system_event(
+            event_type='vod_m3u_download',
+            profile=profile_name or 'all',
+            user=user.username if user else 'anonymous',
+            movies=movies.count(),
+            episodes=episodes.count(),
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+        cache.set(event_cache_key, True, 2)  # Prevent duplicate events for 2 seconds
+
+    response = HttpResponse(m3u_content, content_type="audio/x-mpegurl")
+    response["Content-Disposition"] = 'attachment; filename="vod.m3u"'
     return response
 
 
@@ -1550,6 +1702,8 @@ def generate_epg(request, profile_name=None, user=None):
                     # Icon/poster URL
                     if 'icon' in custom_data:
                         yield f"    <icon src=\"{html.escape(custom_data['icon'])}\" />\n"
+                        # Also add image with type="still" for Jellyfin compatibility
+                        yield f"    <image type=\"still\" src=\"{html.escape(custom_data['icon'])}\" />\n"
 
                     yield f"  </programme>\n"
 
@@ -1599,6 +1753,8 @@ def generate_epg(request, profile_name=None, user=None):
                             # Icon/poster URL
                             if 'icon' in custom_data:
                                 yield f"    <icon src=\"{html.escape(custom_data['icon'])}\" />\n"
+                                # Also add image with type="still" for Jellyfin compatibility
+                                yield f"    <image type=\"still\" src=\"{html.escape(custom_data['icon'])}\" />\n"
 
                             yield f"  </programme>\n"
 
@@ -1812,6 +1968,8 @@ def generate_epg(request, profile_name=None, user=None):
                             # Add icon if available
                             if "icon" in custom_data:
                                 program_xml.append(f'    <icon src="{html.escape(custom_data["icon"])}" />')
+                                # Also add image with type="still" for Jellyfin compatibility
+                                program_xml.append(f'    <image type="still" src="{html.escape(custom_data["icon"])}" />')
 
                             # Add special flags as proper tags with enhanced handling
                             if custom_data.get("previously_shown", False):

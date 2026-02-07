@@ -229,6 +229,21 @@ CELERY_BEAT_SCHEDULE = {
 MEDIA_ROOT = BASE_DIR / "media"
 MEDIA_URL = "/media/"
 
+# STRM file generation settings
+STRM_MEDIA_ROOT = BASE_DIR / "media"
+# STRM_BASE_URL is required in production - must be set via environment variable
+# In development, default to localhost for convenience
+STRM_BASE_URL = os.environ.get("STRM_BASE_URL")
+if not STRM_BASE_URL:
+    if DEBUG:
+        STRM_BASE_URL = "http://localhost:5656"
+    else:
+        # In production, STRM_BASE_URL must be explicitly set
+        raise ValueError(
+            "STRM_BASE_URL environment variable is required in production. "
+            "Please set it to your server's base URL (e.g., http://your-server.com:5656)"
+        )
+
 # Backup settings
 BACKUP_ROOT = os.environ.get("BACKUP_ROOT", "/data/backups")
 BACKUP_DATA_DIRS = [

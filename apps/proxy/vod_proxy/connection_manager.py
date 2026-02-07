@@ -779,8 +779,7 @@ class VODConnectionManager:
 
                     # Forward important headers
                     important_headers = [
-                        'authorization', 'x-forwarded-for', 'x-real-ip',
-                        'referer', 'origin', 'accept'
+                        'authorization', 'referer', 'origin', 'accept'
                     ]
 
                     for header_name in important_headers:
@@ -788,11 +787,6 @@ class VODConnectionManager:
                         if hasattr(request, 'META') and django_header in request.META:
                             headers[header_name] = request.META[django_header]
                             logger.debug(f"[{client_id}] Forwarded header {header_name}")
-
-                    # Add client IP
-                    if client_ip:
-                        headers['X-Forwarded-For'] = client_ip
-                        headers['X-Real-IP'] = client_ip
 
                     # Add Range header if provided for seeking support
                     if range_header:
@@ -854,8 +848,7 @@ class VODConnectionManager:
 
                     # Forward important headers
                     important_headers = [
-                        'authorization', 'x-forwarded-for', 'x-real-ip',
-                        'referer', 'origin', 'accept'
+                        'authorization', 'referer', 'origin', 'accept'
                     ]
 
                     for header_name in important_headers:
@@ -863,11 +856,6 @@ class VODConnectionManager:
                         if hasattr(request, 'META') and django_header in request.META:
                             headers[header_name] = request.META[django_header]
                             logger.debug(f"[{client_id}] Forwarded header {header_name}")
-
-                    # Add client IP
-                    if client_ip:
-                        headers['X-Forwarded-For'] = client_ip
-                        headers['X-Real-IP'] = client_ip
 
                     # Add Range header if provided for seeking support
                     if range_header:

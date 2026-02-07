@@ -321,3 +321,34 @@ class M3UVODCategoryRelation(models.Model):
 
     def __str__(self):
         return f"{self.m3u_account.name} - {self.category.name}"
+
+
+class STRMFile(models.Model):
+    """Tracks generated STRM and NFO files for VOD content"""
+    
+    CONTENT_TYPE_CHOICES = [
+        ('movie', 'Movie'),
+        ('episode', 'Episode'),
+    ]
+    
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+    content_id = models.PositiveIntegerField()
+    content_object = GenericForeignKey('content_type', 'content_id')
+    
+    strm_path = models.CharField(max_length=1024, help_text="Full path to the generated STRM file")
+    nfo_path = models.CharField(max_length=1024, blank=True, null=True, help_text="Full path to the generated NFO file")
+    
+    generated_at = models.DateTimeField(auto_now_add=True, help_text="When the STRM file was first generated")
+    updated_at = models.DateTimeField(auto_now=True, help_text="When the STRM file was last updated")
+    
+    class Meta:
+        verbose_name = 'STRM File'
+        verbose_name_plural = 'STRM Files'
+        unique_together = [('content_type', 'content_id')]
+        indexes = [
+            models.Index(fields=['content_type', 'content_id'], name='vod_strmfile_content_idx'),
+            models.Index(fields=['strm_path'], name='vod_strmfile_strm_path_idx'),
+        ]
+    
+    def __str__(self):
+        return f"{self.get_content_type_display()} STRM: {self.strm_path}"
