@@ -466,38 +466,50 @@ class RedisBackedVODConnection:
             return range_header
 
     def increment_active_streams(self):
-        """Increment active streams count in Redis"""
-        if not self._acquire_lock():
+        """Atomically increment active streams count in Redis"""
+        if not self.redis_client:
             return False
 
         try:
-            state = self._get_connection_state()
-            if state:
-                state.active_streams += 1
-                state.last_activity = time.time()
-                self._save_connection_state(state)
-                logger.debug(f"[{self.session_id}] Active streams incremented to {state.active_streams}")
-                return True
+            if not self.redis_client.exists(self.connection_key):
+                logger.warning(f"[{self.session_id}] No connection state found for increment")
+                return False
+
+            pipe = self.redis_client.pipeline()
+            pipe.hincrby(self.connection_key, 'active_streams', 1)
+            pipe.hset(self.connection_key, 'last_activity', str(time.time()))
+            new_count, _ = pipe.execute()
+            logger.debug(f"[{self.session_id}] Active streams atomically incremented to {new_count}")
+            return True
+        except Exception as e:
+            logger.error(f"[{self.session_id}] Error incrementing active streams: {e}")
             return False
-        finally:
-            self._release_lock()
 
     def decrement_active_streams(self):
-        """Decrement active streams count in Redis"""
-        if not self._acquire_lock():
+        """Atomically decrement active streams count in Redis"""
+        if not self.redis_client:
             return False
 
         try:
-            state = self._get_connection_state()
-            if state and state.active_streams > 0:
-                state.active_streams -= 1
-                state.last_activity = time.time()
-                self._save_connection_state(state)
-                logger.debug(f"[{self.session_id}] Active streams decremented to {state.active_streams}")
-                return True
+            if not self.redis_client.exists(self.connection_key):
+                logger.warning(f"[{self.session_id}] No connection state found for decrement")
+                return False
+
+            pipe = self.redis_client.pipeline()
+            pipe.hincrby(self.connection_key, 'active_streams', -1)
+            pipe.hset(self.connection_key, 'last_activity', str(time.time()))
+            new_count, _ = pipe.execute()
+
+            if new_count < 0:
+                self.redis_client.hset(self.connection_key, 'active_streams', '0')
+                logger.warning(f"[{self.session_id}] active_streams went negative, reset to 0")
+                new_count = 0
+
+            logger.debug(f"[{self.session_id}] Active streams atomically decremented to {new_count}")
+            return True
+        except Exception as e:
+            logger.error(f"[{self.session_id}] Error decrementing active streams: {e}")
             return False
-        finally:
-            self._release_lock()
 
     def has_active_streams(self) -> bool:
         """Check if connection has any active streams"""
@@ -545,8 +557,14 @@ class RedisBackedVODConnection:
             }
         return {}
 
-    def cleanup(self, connection_manager=None, current_worker_id=None):
-        """Smart cleanup based on worker ownership and active streams"""
+    def cleanup(self, connection_manager=None, current_worker_id=None, force=False):
+        """Smart cleanup based on worker ownership and active streams
+        
+        Args:
+            connection_manager: The connection manager instance for decrementing profile connections
+            current_worker_id: The current worker ID for ownership checks
+            force: If True, skip active_streams check and force cleanup even if streams are active
+        """
         # Always clean up local resources first
         if self.local_response:
             self.local_response.close()
@@ -562,8 +580,8 @@ class RedisBackedVODConnection:
             logger.info(f"[{self.session_id}] No connection state found - local cleanup only")
             return
 
-        # Check if there are active streams
-        if state.active_streams > 0:
+        # Check if there are active streams (skip if force=True)
+        if not force and state.active_streams > 0:
             # There are active streams - check ownership
             if current_worker_id and state.worker_id == current_worker_id:
                 logger.info(f"[{self.session_id}] Active streams present ({state.active_streams}) and we own them - local cleanup only")
@@ -571,7 +589,10 @@ class RedisBackedVODConnection:
                 logger.info(f"[{self.session_id}] Active streams present ({state.active_streams}) but owned by worker {state.worker_id} - local cleanup only")
             return
 
-        # No active streams - we can clean up Redis state
+        # Force cleanup or no active streams - we can clean up Redis state
+        if force:
+            logger.info(f"[{self.session_id}] Force cleanup requested - proceeding despite active_streams={state.active_streams}")
+        
         if not self.redis_client:
             logger.info(f"[{self.session_id}] No Redis client - local cleanup only")
             return
@@ -582,13 +603,31 @@ class RedisBackedVODConnection:
             return
 
         try:
-            # Re-check active streams with lock held to prevent race conditions
+            # Re-check active streams with lock held to prevent race conditions (skip if force=True)
             current_state = self._get_connection_state()
             if not current_state:
                 logger.info(f"[{self.session_id}] Connection state no longer exists - cleanup already done")
                 return
 
+            # Safety net: Reset stuck active_streams counter if last_activity is stale
+            # This handles cases where counters are stuck due to previous bugs or race conditions
             if current_state.active_streams > 0:
+                current_time = time.time()
+                time_since_activity = current_time - current_state.last_activity
+                stale_threshold = 10  # Reduced from 30s to 10s for faster detection of stale connections
+                
+                if time_since_activity > stale_threshold:
+                    logger.warning(
+                        f"[{self.session_id}] Safety net: active_streams={current_state.active_streams} but "
+                        f"last_activity is {time_since_activity:.1f}s old (>{stale_threshold}s). "
+                        f"Resetting active_streams to 0."
+                    )
+                    current_state.active_streams = 0
+                    self._save_connection_state(current_state)
+                    # Update current_state reference for logging below
+                    current_state = self._get_connection_state()
+
+            if not force and current_state.active_streams > 0:
                 logger.info(f"[{self.session_id}] Active streams now present ({current_state.active_streams}) - skipping cleanup")
                 return
 
@@ -604,7 +643,10 @@ class RedisBackedVODConnection:
             # Execute all cleanup operations
             pipe.execute()
 
-            logger.info(f"[{self.session_id}] Cleaned up Redis keys (verified no active streams)")
+            if force:
+                logger.info(f"[{self.session_id}] Force cleaned up Redis keys (active_streams={current_state.active_streams})")
+            else:
+                logger.info(f"[{self.session_id}] Cleaned up Redis keys (verified no active streams)")
 
             # Decrement profile connections if we have the state and connection manager
             if state.m3u_profile_id and connection_manager:
@@ -642,6 +684,29 @@ class MultiWorkerVODConnectionManager:
         self.session_ttl = 1800  # 30 minutes TTL for sessions
         self.worker_id = self._get_worker_id()
         logger.info(f"MultiWorkerVODConnectionManager initialized for worker {self.worker_id}")
+
+    def _normalize_user_agent_for_session(self, user_agent: str) -> str:
+        """
+        Normalize user agent for session matching.
+        Groups Jellyfin-related user agents (Lavf/, ffmpeg, ffprobe) together.
+        
+        Args:
+            user_agent: Original user agent string
+            
+        Returns:
+            Normalized user agent string for session matching
+        """
+        if not user_agent:
+            return "unknown"
+        
+        user_agent_lower = user_agent.lower()
+        
+        # Group Jellyfin-related user agents
+        if any(keyword in user_agent_lower for keyword in ['lavf/', 'ffmpeg', 'ffprobe', 'jellyfin']):
+            return "jellyfin_client"
+        
+        # Keep other user agents as-is for now (VLC, etc.)
+        return user_agent
 
     def _get_worker_id(self):
         """Get unique worker ID for this process"""
@@ -701,6 +766,81 @@ class MultiWorkerVODConnectionManager:
             logger.error(f"Error decrementing profile connections: {e}")
             return None
 
+    def _schedule_delayed_cleanup(self, redis_connection, client_id: str, reason: str):
+        """Schedule delayed cleanup with retry logic when no active streams."""
+        def delayed_cleanup():
+            max_retries = 3
+            retry_delay = 0.2  # Reduced from 0.5s to 0.2s for faster cleanup
+
+            for attempt in range(max_retries):
+                time.sleep(retry_delay)
+
+                # Check active streams before cleanup
+                if redis_connection.has_active_streams():
+                    logger.info(
+                        f"[{client_id}] Worker {self.worker_id} - Active streams still present "
+                        f"({attempt + 1}/{max_retries}), retrying cleanup"
+                    )
+                    if attempt < max_retries - 1:
+                        continue
+                    else:
+                        # Last attempt - force cleanup
+                        logger.info(
+                            f"[{client_id}] Worker {self.worker_id} - Forcing cleanup after "
+                            f"{max_retries} retries"
+                        )
+                        redis_connection.cleanup(connection_manager=self, current_worker_id=self.worker_id, force=True)
+                        return
+
+                # Try normal cleanup
+                logger.info(
+                    f"[{client_id}] Worker {self.worker_id} - Attempting cleanup after {reason} "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                redis_connection.cleanup(connection_manager=self, current_worker_id=self.worker_id)
+
+                # Check if cleanup succeeded (connection state should be gone)
+                if not redis_connection._get_connection_state():
+                    logger.info(f"[{client_id}] Worker {self.worker_id} - Cleanup succeeded")
+                    return
+
+                logger.debug(
+                    f"[{client_id}] Worker {self.worker_id} - Cleanup did not complete, will retry"
+                )
+
+            # If we get here, cleanup didn't succeed after all retries
+            # Force cleanup as last resort
+            logger.warning(
+                f"[{client_id}] Worker {self.worker_id} - Cleanup did not succeed after "
+                f"{max_retries} retries, forcing cleanup"
+            )
+            redis_connection.cleanup(connection_manager=self, current_worker_id=self.worker_id, force=True)
+
+        cleanup_thread = threading.Thread(target=delayed_cleanup, daemon=True)
+        cleanup_thread.start()
+
+    def _schedule_safety_net_cleanup(self, redis_connection, client_id: str,
+                                     delay_seconds: float = 5.0, staleness_threshold: float = 5.0):
+        """Schedule a safety-net cleanup if active_streams looks stuck."""
+        def safety_cleanup():
+            time.sleep(delay_seconds)
+            state = redis_connection._get_connection_state()
+            if state and state.active_streams > 0:
+                staleness = time.time() - state.last_activity
+                if staleness > staleness_threshold:
+                    logger.warning(
+                        f"[{client_id}] Safety net: counter stuck at {state.active_streams}, "
+                        f"last_activity {staleness:.1f}s old, forcing cleanup"
+                    )
+                    redis_connection.cleanup(
+                        connection_manager=self,
+                        current_worker_id=self.worker_id,
+                        force=True
+                    )
+
+        cleanup_thread = threading.Thread(target=safety_cleanup, daemon=True)
+        cleanup_thread.start()
+
     def stream_content_with_session(self, session_id, content_obj, stream_url, m3u_profile,
                                   client_ip, client_user_agent, request,
                                   utc_start=None, utc_end=None, offset=None, range_header=None):
@@ -719,7 +859,8 @@ class MultiWorkerVODConnectionManager:
         logger.info(f"[{client_id}] Worker {self.worker_id} - Redis-backed streaming request for {content_type} {content_name}")
 
         try:
-            # First, try to find an existing idle session that matches our criteria
+            # First, try to find an existing session that matches our criteria
+            # First try with allow_active_streams=True to catch Jellyfin's rapid requests
             matching_session_id = self.find_matching_idle_session(
                 content_type=content_type,
                 content_uuid=content_uuid,
@@ -727,23 +868,30 @@ class MultiWorkerVODConnectionManager:
                 client_user_agent=client_user_agent,
                 utc_start=utc_start,
                 utc_end=utc_end,
-                offset=offset
+                offset=offset,
+                allow_active_streams=True  # Allow matching sessions with active streams for same client+content
             )
+            
+            # If no match with active streams allowed, try again for idle sessions only
+            if not matching_session_id:
+                matching_session_id = self.find_matching_idle_session(
+                    content_type=content_type,
+                    content_uuid=content_uuid,
+                    client_ip=client_ip,
+                    client_user_agent=client_user_agent,
+                    utc_start=utc_start,
+                    utc_end=utc_end,
+                    offset=offset,
+                    allow_active_streams=False  # Only idle sessions
+                )
 
             # Use matching session if found, otherwise use the provided session_id
             if matching_session_id:
                 logger.info(f"[{client_id}] Worker {self.worker_id} - Found matching idle session: {matching_session_id}")
                 effective_session_id = matching_session_id
                 client_id = matching_session_id  # Update client_id for logging consistency
-
-                # IMMEDIATELY reserve this session by incrementing active streams to prevent cleanup
-                temp_connection = RedisBackedVODConnection(effective_session_id, self.redis_client)
-                if temp_connection.increment_active_streams():
-                    logger.info(f"[{client_id}] Reserved idle session - incremented active streams")
-                else:
-                    logger.warning(f"[{client_id}] Failed to reserve idle session - falling back to new session")
-                    effective_session_id = session_id
-                    matching_session_id = None  # Clear the match so we create a new connection
+                # Note: We don't increment active_streams here - it will be done inside the generator
+                # to ensure it's always paired with a decrement in the finally block
             else:
                 logger.info(f"[{client_id}] Worker {self.worker_id} - No matching idle session found, using new session")
                 effective_session_id = session_id
@@ -846,13 +994,14 @@ class MultiWorkerVODConnectionManager:
                 try:
                     logger.info(f"[{client_id}] Worker {self.worker_id} - Starting Redis-backed stream")
 
-                    # Increment active streams (unless we already did it for session reuse)
-                    if not matching_session_id:
-                        # New session - increment active streams
-                        redis_connection.increment_active_streams()
+                    # Increment active streams for ALL sessions (both new and reused)
+                    # This ensures increment and decrement are in the same scope (the generator),
+                    # guaranteeing cleanup even if the request fails before streaming starts
+                    redis_connection.increment_active_streams()
+                    if matching_session_id:
+                        logger.debug(f"[{client_id}] Incremented active streams for reused session")
                     else:
-                        # Reused session - we already incremented when reserving the session
-                        logger.debug(f"[{client_id}] Using pre-reserved session - active streams already incremented")
+                        logger.debug(f"[{client_id}] Incremented active streams for new session")
 
                     bytes_sent = 0
                     chunk_count = 0
@@ -891,42 +1040,93 @@ class MultiWorkerVODConnectionManager:
 
                     if stop_signal_detected:
                         logger.info(f"[{client_id}] Worker {self.worker_id} - Stream stopped by signal: {bytes_sent} bytes sent")
+                        decrement_result = redis_connection.decrement_active_streams()
+                        if decrement_result:
+                            decremented = True
+                        # Force immediate cleanup when stop signal is detected
+                        logger.info(f"[{client_id}] Worker {self.worker_id} - Forcing immediate cleanup after stop signal")
+                        redis_connection.cleanup(connection_manager=self, current_worker_id=self.worker_id, force=True)
                     else:
                         logger.info(f"[{client_id}] Worker {self.worker_id} - Redis-backed stream completed: {bytes_sent} bytes sent")
-                    redis_connection.decrement_active_streams()
-                    decremented = True
+                        decrement_result = redis_connection.decrement_active_streams()
+                        if decrement_result:
+                            decremented = True
 
-                    # Schedule smart cleanup if no active streams after normal completion
+                        # Schedule smart cleanup if no active streams after normal completion
+                        if not redis_connection.has_active_streams():
+                            self._schedule_delayed_cleanup(
+                                redis_connection,
+                                client_id,
+                                reason="normal completion"
+                            )
+                        else:
+                            self._schedule_safety_net_cleanup(redis_connection, client_id)
+
+                except (OSError, BrokenPipeError, ConnectionResetError) as e:
+                    # Handle broken pipe and connection reset errors during yield
+                    # These occur when client disconnects during streaming
+                    logger.info(f"[{client_id}] Worker {self.worker_id} - Client disconnected (broken pipe/connection reset): {type(e).__name__}")
+                    decrement_result = None
+                    if not decremented:
+                        # Try to decrement - even if it returns False (already at 0), we still need to check for cleanup
+                        decrement_result = redis_connection.decrement_active_streams()
+                        if not decrement_result:
+                            logger.info(f"[{client_id}] Worker {self.worker_id} - Active streams already at 0 (race condition detected)")
+                        else:
+                            decremented = True
+
+                    # Always check for cleanup after disconnect, even if decrement returned False
+                    # This handles the case where multiple workers disconnect simultaneously
+                    # If decrement returned False (race condition), be more aggressive with cleanup
                     if not redis_connection.has_active_streams():
-                        def delayed_cleanup():
-                            time.sleep(1)  # Wait 1 second
-                            # Smart cleanup: check active streams and ownership
-                            logger.info(f"[{client_id}] Worker {self.worker_id} - Checking for smart cleanup after normal completion")
-                            redis_connection.cleanup(connection_manager=self, current_worker_id=self.worker_id)
-
-                        import threading
-                        cleanup_thread = threading.Thread(target=delayed_cleanup)
-                        cleanup_thread.daemon = True
-                        cleanup_thread.start()
+                        # If we detected a race condition (decrement returned False), force cleanup immediately
+                        if decrement_result is False:
+                            logger.info(f"[{client_id}] Worker {self.worker_id} - Race condition detected, forcing immediate cleanup")
+                            redis_connection.cleanup(connection_manager=self, current_worker_id=self.worker_id, force=True)
+                        else:
+                            self._schedule_delayed_cleanup(
+                                redis_connection,
+                                client_id,
+                                reason="client disconnect"
+                            )
+                    else:
+                        # Even if active streams are present, log this for debugging
+                        state = redis_connection._get_connection_state()
+                        active_count = state.active_streams if state else 'unknown'
+                        logger.debug(f"[{client_id}] Worker {self.worker_id} - Active streams still present ({active_count}), scheduling safety-net cleanup")
+                        self._schedule_safety_net_cleanup(redis_connection, client_id)
 
                 except GeneratorExit:
-                    logger.info(f"[{client_id}] Worker {self.worker_id} - Client disconnected from Redis-backed stream")
+                    logger.info(f"[{client_id}] Worker {self.worker_id} - Client disconnected from Redis-backed stream (generator exit)")
+                    decrement_result = None
                     if not decremented:
-                        redis_connection.decrement_active_streams()
-                        decremented = True
+                        # Try to decrement - even if it returns False (already at 0), we still need to check for cleanup
+                        decrement_result = redis_connection.decrement_active_streams()
+                        if not decrement_result:
+                            logger.info(f"[{client_id}] Worker {self.worker_id} - Active streams already at 0 (race condition detected)")
+                        else:
+                            decremented = True
 
-                    # Schedule smart cleanup if no active streams
+                    # Always check for cleanup after disconnect, even if decrement returned False
+                    # This handles the case where multiple workers disconnect simultaneously
+                    # If decrement returned False (race condition), be more aggressive with cleanup
                     if not redis_connection.has_active_streams():
-                        def delayed_cleanup():
-                            time.sleep(1)  # Wait 1 second
-                            # Smart cleanup: check active streams and ownership
-                            logger.info(f"[{client_id}] Worker {self.worker_id} - Checking for smart cleanup after client disconnect")
-                            redis_connection.cleanup(connection_manager=self, current_worker_id=self.worker_id)
-
-                        import threading
-                        cleanup_thread = threading.Thread(target=delayed_cleanup)
-                        cleanup_thread.daemon = True
-                        cleanup_thread.start()
+                        # If we detected a race condition (decrement returned False), force cleanup immediately
+                        if decrement_result is False:
+                            logger.info(f"[{client_id}] Worker {self.worker_id} - Race condition detected, forcing immediate cleanup")
+                            redis_connection.cleanup(connection_manager=self, current_worker_id=self.worker_id, force=True)
+                        else:
+                            self._schedule_delayed_cleanup(
+                                redis_connection,
+                                client_id,
+                                reason="client disconnect"
+                            )
+                    else:
+                        # Even if active streams are present, log this for debugging
+                        state = redis_connection._get_connection_state()
+                        active_count = state.active_streams if state else 'unknown'
+                        logger.debug(f"[{client_id}] Worker {self.worker_id} - Active streams still present ({active_count}), scheduling safety-net cleanup")
+                        self._schedule_safety_net_cleanup(redis_connection, client_id)
 
                 except Exception as e:
                     logger.error(f"[{client_id}] Worker {self.worker_id} - Error in Redis-backed stream: {e}")
@@ -938,8 +1138,14 @@ class MultiWorkerVODConnectionManager:
                     yield b"Error: Stream interrupted"
 
                 finally:
+                    # Always decrement active streams to ensure cleanup, even if exception occurred
+                    # This is the safety net that guarantees every increment is matched with a decrement
                     if not decremented:
+                        logger.debug(f"[{client_id}] Worker {self.worker_id} - Finally block: decrementing active streams (was not decremented in exception handler)")
                         redis_connection.decrement_active_streams()
+                        decremented = True
+                    else:
+                        logger.debug(f"[{client_id}] Worker {self.worker_id} - Finally block: active streams already decremented")
 
             # Create streaming response
             response = StreamingHttpResponse(
@@ -1118,12 +1324,17 @@ class MultiWorkerVODConnectionManager:
             logger.error(f"Error applying timeshift parameters: {e}")
             return original_url
 
-    def cleanup_persistent_connection(self, session_id: str):
-        """Clean up a specific Redis-backed persistent connection"""
-        logger.info(f"[{session_id}] Cleaning up Redis-backed persistent connection")
+    def cleanup_persistent_connection(self, session_id: str, force=False):
+        """Clean up a specific Redis-backed persistent connection
+        
+        Args:
+            session_id: The session ID to clean up
+            force: If True, force cleanup even if active streams are present
+        """
+        logger.info(f"[{session_id}] Cleaning up Redis-backed persistent connection (force={force})")
 
         redis_connection = RedisBackedVODConnection(session_id, self.redis_client)
-        redis_connection.cleanup(connection_manager=self)
+        redis_connection.cleanup(connection_manager=self, force=force)
 
         # The cleanup method now handles all Redis keys including session data
 
@@ -1295,12 +1506,32 @@ class MultiWorkerVODConnectionManager:
 
     def find_matching_idle_session(self, content_type: str, content_uuid: str,
                                  client_ip: str, client_user_agent: str,
-                                 utc_start=None, utc_end=None, offset=None) -> Optional[str]:
-        """Find existing Redis-backed session that matches criteria using consolidated connection state"""
+                                 utc_start=None, utc_end=None, offset=None,
+                                 allow_active_streams=False) -> Optional[str]:
+        """
+        Find existing Redis-backed session that matches criteria using consolidated connection state.
+        
+        Args:
+            content_type: Type of content (movie, episode, series)
+            content_uuid: UUID of the content
+            client_ip: Client IP address
+            client_user_agent: Client user agent
+            utc_start: UTC start time for timeshift
+            utc_end: UTC end time for timeshift
+            offset: Offset in seconds
+            allow_active_streams: If True, match sessions even if they have active streams
+                                 (useful for Jellyfin's rapid request pattern)
+        
+        Returns:
+            Session ID if matching session found, None otherwise
+        """
         if not self.redis_client:
             return None
 
         try:
+            # Normalize user agent for matching
+            normalized_ua = self._normalize_user_agent_for_session(client_user_agent)
+            
             # Search for connections with consolidated session data
             pattern = "vod_persistent_connection:*"
             cursor = 0
@@ -1329,9 +1560,27 @@ class MultiWorkerVODConnectionManager:
                         # Extract session ID
                         session_id = key.decode('utf-8').replace('vod_persistent_connection:', '')
 
-                        # Check if Redis-backed connection exists and has no active streams
+                        # Check if Redis-backed connection exists and has state
                         redis_connection = RedisBackedVODConnection(session_id, self.redis_client)
-                        if redis_connection.has_active_streams():
+                        connection_state = redis_connection._get_connection_state()
+                        
+                        # Skip if connection state doesn't exist (was cleaned up)
+                        if not connection_state:
+                            logger.debug(f"[{session_id}] Connection state not found (likely cleaned up), skipping")
+                            continue
+                        
+                        # Check if connection is stale (last activity > 10 seconds ago and no active streams)
+                        # This helps avoid matching sessions that are in the process of being cleaned up
+                        current_time = time.time()
+                        time_since_activity = current_time - connection_state.last_activity
+                        if time_since_activity > 10 and connection_state.active_streams == 0:
+                            logger.debug(f"[{session_id}] Connection is stale (last activity {time_since_activity:.1f}s ago), skipping")
+                            continue
+                        
+                        has_active = redis_connection.has_active_streams()
+                        
+                        # Skip if has active streams and we don't allow them
+                        if has_active and not allow_active_streams:
                             continue
 
                         # Calculate match score
@@ -1341,12 +1590,15 @@ class MultiWorkerVODConnectionManager:
                         # Check other criteria (using consolidated data)
                         stored_client_ip = connection_data.get('client_ip', '')
                         stored_user_agent = connection_data.get('client_user_agent', '') or connection_data.get('user_agent', '')
+                        stored_normalized_ua = self._normalize_user_agent_for_session(stored_user_agent)
 
+                        # Exact IP match
                         if stored_client_ip and stored_client_ip == client_ip:
                             score += 5
                             match_reasons.append("ip")
-
-                        if stored_user_agent and stored_user_agent == client_user_agent:
+                        
+                        # Normalized user agent match (groups Jellyfin-related UAs)
+                        if stored_normalized_ua == normalized_ua:
                             score += 3
                             match_reasons.append("user-agent")
 
@@ -1365,12 +1617,23 @@ class MultiWorkerVODConnectionManager:
                             score += 7
                             match_reasons.append("timeshift")
 
-                        if score >= 13:  # Good match threshold
+                        # For exact client+content matches, allow even with active streams
+                        # This handles Jellyfin's rapid request pattern
+                        if score >= 18:  # content(10) + ip(5) + user-agent(3) = 18 (exact match)
                             matching_sessions.append({
                                 'session_id': session_id,
                                 'score': score,
                                 'reasons': match_reasons,
-                                'last_activity': float(connection_data.get('last_activity', '0'))
+                                'last_activity': float(connection_data.get('last_activity', '0')),
+                                'has_active_streams': has_active
+                            })
+                        elif score >= 13 and not has_active:  # Good match but only if idle
+                            matching_sessions.append({
+                                'session_id': session_id,
+                                'score': score,
+                                'reasons': match_reasons,
+                                'last_activity': float(connection_data.get('last_activity', '0')),
+                                'has_active_streams': has_active
                             })
 
                     except Exception as e:
@@ -1380,12 +1643,19 @@ class MultiWorkerVODConnectionManager:
                 if cursor == 0:
                     break
 
-            # Sort by score and last activity
-            matching_sessions.sort(key=lambda x: (x['score'], x['last_activity']), reverse=True)
+            # Sort by: exact matches first (score >= 18), then by score, then by last activity
+            # Prefer sessions without active streams when scores are equal
+            matching_sessions.sort(key=lambda x: (
+                x['score'] >= 18,  # Exact matches first
+                x['score'],
+                not x['has_active_streams'],  # Prefer idle sessions
+                x['last_activity']
+            ), reverse=True)
 
             if matching_sessions:
                 best_match = matching_sessions[0]
-                logger.info(f"Found matching Redis-backed idle session: {best_match['session_id']} "
+                status = "active" if best_match['has_active_streams'] else "idle"
+                logger.info(f"Found matching Redis-backed {status} session: {best_match['session_id']} "
                           f"(score: {best_match['score']}, reasons: {', '.join(best_match['reasons'])})")
                 return best_match['session_id']
 

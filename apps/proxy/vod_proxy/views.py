@@ -6,6 +6,7 @@ Supports M3U profiles for authentication and URL transformation.
 import time
 import random
 import logging
+import hashlib
 import requests
 from django.http import StreamingHttpResponse, JsonResponse, Http404, HttpResponse
 from django.shortcuts import get_object_or_404
@@ -16,6 +17,7 @@ from apps.vod.models import Movie, Series, Episode
 from apps.m3u.models import M3UAccount, M3UAccountProfile
 from apps.proxy.vod_proxy.connection_manager import VODConnectionManager
 from apps.proxy.vod_proxy.multi_worker_connection_manager import MultiWorkerVODConnectionManager, infer_content_type_from_url, get_vod_client_stop_key
+from core.utils import RedisClient
 from .utils import get_client_info, create_vod_response
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,144 @@ logger = logging.getLogger(__name__)
 @method_decorator(csrf_exempt, name='dispatch')
 class VODStreamView(View):
     """Handle VOD streaming requests with M3U profile support"""
+
+    def _normalize_user_agent_for_session(self, user_agent: str) -> str:
+        """
+        Normalize user agent for session matching.
+        Groups Jellyfin-related user agents (Lavf/, ffmpeg, ffprobe) together.
+        
+        Args:
+            user_agent: Original user agent string
+            
+        Returns:
+            Normalized user agent string for session matching
+        """
+        if not user_agent:
+            return "unknown"
+        
+        user_agent_lower = user_agent.lower()
+        
+        # Group Jellyfin-related user agents
+        if any(keyword in user_agent_lower for keyword in ['lavf/', 'ffmpeg', 'ffprobe', 'jellyfin']):
+            return "jellyfin_client"
+        
+        # Keep other user agents as-is for now (VLC, etc.)
+        return user_agent
+
+    def _generate_deterministic_session_id(self, client_ip: str, user_agent: str, 
+                                         content_id: str, profile_id: int = None) -> str:
+        """
+        Generate a deterministic session ID based on client IP, user agent, content ID, and profile ID.
+        This ensures all requests from the same client for the same content share one session.
+        
+        Args:
+            client_ip: Client IP address
+            user_agent: Client user agent (will be normalized)
+            content_id: Content UUID
+            profile_id: Optional profile ID
+            
+        Returns:
+            Deterministic session ID in format: vod_{hash_prefix}
+        """
+        # Normalize user agent for consistent hashing
+        normalized_ua = self._normalize_user_agent_for_session(user_agent)
+        
+        # Create hash input string
+        hash_input = f"{client_ip}:{normalized_ua}:{content_id}"
+        if profile_id:
+            hash_input += f":{profile_id}"
+        
+        # Generate hash
+        hash_obj = hashlib.sha256(hash_input.encode('utf-8'))
+        hash_hex = hash_obj.hexdigest()
+        
+        # Use first 16 characters of hash for session ID (keeps it readable)
+        hash_prefix = hash_hex[:16]
+        
+        session_id = f"vod_{hash_prefix}"
+        logger.debug(f"[VOD-SESSION] Generated deterministic session ID: {session_id} from {client_ip}, {normalized_ua}, {content_id}")
+        
+        return session_id
+
+    def _find_existing_session_for_client(self, client_ip: str, user_agent: str,
+                                         content_type: str, content_id: str,
+                                         profile_id: int = None) -> str:
+        """
+        Find an existing session for the same client and content.
+        Searches Redis for existing sessions matching client IP, user agent, content, and profile.
+        
+        Args:
+            client_ip: Client IP address
+            user_agent: Client user agent
+            content_type: Content type (movie, episode, series)
+            content_id: Content UUID
+            profile_id: Optional profile ID
+            
+        Returns:
+            Existing session ID if found, None otherwise
+        """
+        redis_client = RedisClient.get_client()
+        if not redis_client:
+            return None
+        
+        try:
+            normalized_ua = self._normalize_user_agent_for_session(user_agent)
+            
+            # Search for existing persistent connections
+            pattern = "vod_persistent_connection:*"
+            cursor = 0
+            
+            while True:
+                cursor, keys = redis_client.scan(cursor, match=pattern, count=100)
+                
+                for key in keys:
+                    try:
+                        connection_data = redis_client.hgetall(key)
+                        if not connection_data:
+                            continue
+                        
+                        # Convert bytes to strings if needed
+                        if isinstance(list(connection_data.keys())[0], bytes):
+                            connection_data = {k.decode('utf-8'): v.decode('utf-8') for k, v in connection_data.items()}
+                        
+                        # Check if content matches
+                        stored_content_type = connection_data.get('content_obj_type', '')
+                        stored_content_uuid = connection_data.get('content_uuid', '')
+                        
+                        if stored_content_type != content_type or stored_content_uuid != content_id:
+                            continue
+                        
+                        # Check if client matches
+                        stored_client_ip = connection_data.get('client_ip', '')
+                        stored_user_agent = connection_data.get('client_user_agent', '') or connection_data.get('user_agent', '')
+                        stored_normalized_ua = self._normalize_user_agent_for_session(stored_user_agent)
+                        
+                        if stored_client_ip != client_ip or stored_normalized_ua != normalized_ua:
+                            continue
+                        
+                        # Check profile ID if provided
+                        if profile_id:
+                            stored_profile_id = connection_data.get('m3u_profile_id', '')
+                            if stored_profile_id and int(stored_profile_id) != profile_id:
+                                continue
+                        
+                        # Found matching session
+                        session_id = key.decode('utf-8').replace('vod_persistent_connection:', '')
+                        logger.info(f"[VOD-SESSION] Found existing session {session_id} for client {client_ip} and content {content_id}")
+                        return session_id
+                        
+                    except Exception as e:
+                        logger.debug(f"Error processing connection key {key}: {e}")
+                        continue
+                
+                if cursor == 0:
+                    break
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding existing session: {e}")
+            return None
 
     def get(self, request, content_type, content_id, session_id=None, profile_id=None):
         """
@@ -110,10 +250,29 @@ class VODStreamView(View):
 
             logger.info(f"[VOD-CLIENT] Client info - IP: {client_ip}, User-Agent: {client_user_agent[:50]}...")
 
-            # If no session ID, create one and redirect to path-based URL
+            # If no session ID, try to find existing session or create a new one
             if not session_id:
-                new_session_id = f"vod_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                logger.info(f"[VOD-SESSION] Creating new session: {new_session_id}")
+                # First, try to find an existing session for this client and content
+                existing_session_id = self._find_existing_session_for_client(
+                    client_ip=client_ip,
+                    user_agent=client_user_agent,
+                    content_type=content_type,
+                    content_id=str(content_id),
+                    profile_id=profile_id
+                )
+                
+                if existing_session_id:
+                    logger.info(f"[VOD-SESSION] Reusing existing session: {existing_session_id}")
+                    new_session_id = existing_session_id
+                else:
+                    # Generate deterministic session ID based on client, content, and profile
+                    new_session_id = self._generate_deterministic_session_id(
+                        client_ip=client_ip,
+                        user_agent=client_user_agent,
+                        content_id=str(content_id),
+                        profile_id=profile_id
+                    )
+                    logger.info(f"[VOD-SESSION] Generated deterministic session: {new_session_id}")
 
                 # Build redirect URL with session ID in path, preserve query parameters
                 path_parts = request.path.rstrip('/').split('/')
@@ -235,10 +394,29 @@ class VODStreamView(View):
             client_ip, client_user_agent = get_client_info(request)
             logger.info(f"[VOD-HEAD] Client info - IP: {client_ip}, User-Agent: {client_user_agent[:50] if client_user_agent else 'None'}...")
 
-            # If no session ID, create one (same logic as GET)
+            # If no session ID, try to find existing session or create a new one (same logic as GET)
             if not session_id:
-                new_session_id = f"vod_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                logger.info(f"[VOD-HEAD] Creating new session for HEAD: {new_session_id}")
+                # First, try to find an existing session for this client and content
+                existing_session_id = self._find_existing_session_for_client(
+                    client_ip=client_ip,
+                    user_agent=client_user_agent,
+                    content_type=content_type,
+                    content_id=str(content_id),
+                    profile_id=profile_id
+                )
+                
+                if existing_session_id:
+                    logger.info(f"[VOD-HEAD] Reusing existing session: {existing_session_id}")
+                    new_session_id = existing_session_id
+                else:
+                    # Generate deterministic session ID based on client, content, and profile
+                    new_session_id = self._generate_deterministic_session_id(
+                        client_ip=client_ip,
+                        user_agent=client_user_agent,
+                        content_id=str(content_id),
+                        profile_id=profile_id
+                    )
+                    logger.info(f"[VOD-HEAD] Generated deterministic session: {new_session_id}")
 
                 # Build session URL for response header
                 path_parts = request.path.rstrip('/').split('/')
@@ -1059,6 +1237,13 @@ def stop_vod_client(request):
         redis_client.setex(stop_key, 60, "true")  # 60 second TTL
 
         logger.info(f"Set stop signal for VOD client: {client_id}")
+
+        # Also trigger immediate cleanup with force to ensure profile counter is decremented
+        try:
+            connection_manager.cleanup_persistent_connection(client_id, force=True)
+            logger.info(f"Triggered force cleanup for VOD client: {client_id}")
+        except Exception as cleanup_error:
+            logger.warning(f"Error during force cleanup for {client_id}: {cleanup_error}")
 
         return JsonResponse({
             'message': 'VOD client stop signal sent',
