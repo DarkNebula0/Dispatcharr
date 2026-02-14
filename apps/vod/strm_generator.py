@@ -314,9 +314,11 @@ def is_anime(movie_or_series, info=None, category=None):
     Determine if content is anime.
     
     Checks in order:
-    1. Database category (if category name contains "anime" or matches anime category)
-    2. Language detection (ja = Japanese)
-    3. Known anime titles list (optional)
+    1. Database category (if category name contains animation-related terms)
+    2. Genre field (if genre contains "Animation" or "Anime")
+    3. Language detection (ja = Japanese)
+    4. Known anime studios in title/description
+    5. Known anime titles list (optional)
     
     Args:
         movie_or_series: Movie or Series model instance
@@ -326,11 +328,38 @@ def is_anime(movie_or_series, info=None, category=None):
     Returns:
         True if anime, False otherwise
     """
-    # Check database category first
+    # Animation-related category keywords (case-insensitive matching)
+    animation_keywords = [
+        'anime',
+        'animation',
+        'cartoon',
+        'ghibli',
+        'studio ghibli',
+        'anime movie',
+        'animated',
+    ]
+    
+    # Known anime studios (for checking in title/description)
+    anime_studios = [
+        'studio ghibli',
+        'ghibli',
+        'madhouse',
+        'bones',
+        'ufotable',
+        'kyoto animation',
+        'a-1 pictures',
+        'production i.g',
+        'wit studio',
+        'trigger',
+        'gainax',
+    ]
+    
+    # Check database category first (expanded matching)
     if category:
         cat_name = category.name.lower()
-        if 'anime' in cat_name:
-            return True
+        for keyword in animation_keywords:
+            if keyword in cat_name:
+                return True
     
     # If no category provided, try to get from relations
     if not category:
@@ -338,8 +367,18 @@ def is_anime(movie_or_series, info=None, category=None):
             first_relation = movie_or_series.m3u_relations.select_related('category').first()
             if first_relation and first_relation.category:
                 cat_name = first_relation.category.name.lower()
-                if 'anime' in cat_name:
-                    return True
+                for keyword in animation_keywords:
+                    if keyword in cat_name:
+                        return True
+    
+    # Check genre field (can be comma-separated)
+    if hasattr(movie_or_series, 'genre') and movie_or_series.genre:
+        genre_str = str(movie_or_series.genre).lower()
+        # Split on comma and check each genre
+        genres = [g.strip() for g in genre_str.split(',')]
+        for genre in genres:
+            if 'animation' in genre or 'anime' in genre:
+                return True
     
     # Check language from info (ja = Japanese)
     if info and info.get('language'):
@@ -347,13 +386,25 @@ def is_anime(movie_or_series, info=None, category=None):
         if lang == 'ja' or lang == 'japanese':
             return True
     
-    # Check title for known anime titles (optional, can be extended)
+    # Check title/description for known anime studios
     title = ""
+    description = ""
+    
     if info and info.get('title'):
         title = str(info['title']).lower()
     elif hasattr(movie_or_series, 'name'):
         title = movie_or_series.name.lower()
     
+    if hasattr(movie_or_series, 'description') and movie_or_series.description:
+        description = str(movie_or_series.description).lower()
+    
+    # Check if any anime studio appears in title or description
+    combined_text = f"{title} {description}".lower()
+    for studio in anime_studios:
+        if studio in combined_text:
+            return True
+    
+    # Check title for known anime titles (optional, can be extended)
     known_anime_titles = {
         "akira",
         "belle",
